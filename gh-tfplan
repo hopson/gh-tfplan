@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -e
+set -o pipefail
+
+base_branch=${BASE_BRANCH:-main}
+tf_basedir=${TF_BASEDIR:-apps/infra/src}
+reponame=${REPONAME:$(gh repo view --jq .nameWithOwner --json nameWithOwner)
+
+log_prefix=" * "
+function warn(){
+  echo -e "${log_prefix}\033[33;m${*}\033[0m"
+}
+
+function info(){
+  echo -e "${log_prefix}\033[32;m${*}\033[0m"
+}
+
+function debug(){
+  echo -e "${log_prefix}\033[34;m${*}\033[0m"
+}
+
+
+#
+# Determine branch and remote info
+#
+branch=$(git rev-parse --symbolic-full-name --abbrev-ref HEAD)
+remote_branch=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} &>/dev/null || echo -n "")
+if [[ -n "$remote_branch" ]]; then
+  remote=$(basename ${remote_branch})
+else
+  # if no tracking branch exists, poke at the repo and figure one out
+  remotes=$(git remote show)
+  if [[ $(echo "$remotes" | wc -l) -eq 1 ]]; then
+    remote=$remotes
+  else
+    remote=$(git remote -v |grep "(push)" | awk '{print $1}')
+  fi
+fi
+
+#
+# Check if any terraform files have changed
+#
+function check_for_changes() {
+  local tf_files=$(git diff --name-only HEAD ${remote}/${base_branch} | awk '/.(tf|yml)$/')
+  if [[ -z "${tf_files}" ]]; then
+    warn "No terraform files have changed between this branch and \`${remote}/${base_branch}\`"
+    exit 1
+  fi
+}
+
+#
+# Push branch to remote if it doesn't exist
+#
+function push_remote() {
+  if ! gh api /repos/${reponame}/compare/${base_branch}...${branch} --silent 2>/dev/null; then
+    info "Pushing to remote branch ${remote}/${branch}"
+    git push --quiet --set-upstream ${remote} ${branch}
+  fi
+}
+
+function show_help() {
+  local helptext=$(cat <<-EOHELP
+  Usage:
+    gh tfplan [options]
+    Options:
+      -e <environment> Use ${tf_basedir}/<environment> as the terraform root module
+      -s               Output formatted 'terraform plan' text only, do not create a PR
+
+EOHELP
+)
+  echo "$helptext"
+}
+
+function run_terraform() {
+  local tf_env=$1
+  local tf_dir=$(git rev-parse --show-toplevel)/${tf_basedir}/${tf_env}
+  terraform -chdir=${tf_dir} plan -lock=false -refresh=true -no-color | awk 'OUTPUT==1 { print }; $0 ~ "^Terraform will perform the following actions:" { OUTPUT=1 }; (OUTPUT==1 && $0 ~ "^Plan:") { OUTPUT=0 }'
+}
+
+function plan_summary() {
+  awk '/^Plan:/'
+}
+
+tf_env=production
+show_only=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --environment|-e)
+      tf_env=$2
+      shift
+      ;;
+    --show|-s)
+      show_only=1
+      ;;
+    --help|-h)
+      show_help
+      exit 0
+      ;;
+  esac
+  shift
+done
+
+check_for_changes
+msg="Running terraform plan on ${tf_env}..."
+info $msg
+
+start=$(date +%s)
+PR_BODY_FILENAME=$(mktemp)
+PLAN=$(run_terraform $tf_env)
+SUMMARY=$(echo "$PLAN" | plan_summary)
+end=$(date +%s)
+
+echo -e "\033[1A\033[$((${#msg} + ${#log_prefix} +1 ))C$((end - start))s"
+debug "Plan results: ${SUMMARY}"
+
+cat <<EOF >> $PR_BODY_FILENAME
+<details>
+<summary>
+${SUMMARY}
+</summary>
+
+\`\`\`hcl
+${PLAN}
+\`\`\`
+EOF
+
+cat $PR_BODY_FILENAME
+if [[ "$show_only" -eq 0 ]]; then
+  read -p "Use this plan? y/[N]: " -n 1 -r confirm; echo;
+  if [[ "${confirm:-N}" =~ ^[Yy] ]]; then
+    push_remote
+    exec gh pr create --base ${base_branch} --body-file $PR_BODY_FILENAME
+  else
+    warn Cancelling
+  fi
+else
+  cat $PR_BODY_FILENAME
+fi
