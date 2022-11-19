@@ -4,9 +4,10 @@ set -o pipefail
 
 base_branch=${BASE_BRANCH:-main}
 tf_basedir=${TF_BASEDIR:-apps/infra/src}
-reponame=${REPONAME:$(gh repo view --jq .nameWithOwner --json nameWithOwner)
+reponame=${REPONAME:$(gh repo view --jq .nameWithOwner --json nameWithOwner)}
 
 log_prefix=" * "
+
 function warn(){
   echo -e "${log_prefix}\033[33;m${*}\033[0m"
 }
